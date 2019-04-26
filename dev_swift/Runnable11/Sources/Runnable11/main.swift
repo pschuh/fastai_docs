@@ -1,6 +1,7 @@
 // export
 import Path
 import TensorFlow
+import nvToolsExt
 
 let path = downloadImagette()
 
@@ -24,9 +25,10 @@ print(batch.yb.shape)
 let labels = batch.yb.scalars.map { procLabel.vocab![Int($0)] }
 // showImages(batch.xb, labels: labels)
 
-public struct ConvLayer: Layer {
+public struct ConvLayer: FALayer {
     public var bn: FABatchNorm<Float>
     public var conv: FANoBiasConv2D<Float>
+    @noDerivative public var delegate: LayerDelegate<Output> = LayerDelegate()
     
     public init(_ cIn: Int, _ cOut: Int, ks: Int = 3, stride: Int = 1, zeroBn: Bool = false, act: Bool = true){
         bn = FABatchNorm(featureCount: cOut)
@@ -39,7 +41,7 @@ public struct ConvLayer: Layer {
     }
     
     @differentiable
-    public func call(_ input: TF) -> TF {
+    public func forward(_ input: TF) -> TF {
         return bn(conv(input))
     }
 }
@@ -90,7 +92,8 @@ public struct MaybeConv: SwitchableLayer {
     }
 }
 
-public struct ResBlock: Layer {
+public struct ResBlock: FALayer {
+    @noDerivative public var delegate: LayerDelegate<Output> = LayerDelegate()
     public var convs: [ConvLayer]
     public var idConv: MaybeConv
     public var pool: MaybeAvgPool2D
@@ -109,7 +112,7 @@ public struct ResBlock: Layer {
     }
     
     @differentiable
-    public func call(_ inp: TF) -> TF {
+    public func forward(_ inp: TF) -> TF {
         return relu(convs(inp) + idConv(pool(inp)))
     }
     
@@ -119,7 +122,8 @@ func makeLayer(_ expansion: Int, _ ni: Int, _ nf: Int, _ nBlocks: Int, stride: I
     return Array(0..<nBlocks).map { ResBlock(expansion, $0==0 ? ni : nf, nf, stride: $0==0 ? stride : 1) }
 }
 
-public struct XResNet: Layer {
+public struct XResNet: FALayer {
+    @noDerivative public var delegate: LayerDelegate<Output> = LayerDelegate()
     public var stem: [ConvLayer]
     public var maxPool = MaxPool2D<Float>(poolSize: (3,3), strides: (2,2), padding: .same)
     public var blocks: [ResBlock]
@@ -137,11 +141,128 @@ public struct XResNet: Layer {
     }
     
     @differentiable
-    public func call(_ inp: TF) -> TF {
+    public func forward(_ inp: TF) -> TF {
         return linear(pool(blocks(maxPool(stem(inp)))))
     }
     
 }
+
+// export
+extension Learner where Opt.Scalar: BinaryFloatingPoint {
+    public class StopEarly: Delegate {
+        private var numIter: Int
+        public init(numIter: Int = 100) { self.numIter = numIter }
+        override public func batchDidFinish(learner: Learner) throws {
+            if learner.currentIter >= numIter { throw LearnerAction.stop }
+        }
+    }
+    
+    public func makeStopEarly(numIter: Int) -> StopEarly {
+        return StopEarly(numIter: numIter)
+    }
+}
+
+/// Adam optimizer.
+///
+/// Reference: ["Adam - A Method for Stochastic Optimization"](
+/// https://arxiv.org/abs/1412.6980v8)
+public class FAAdam<Model: Layer>: Optimizer
+    where Model.AllDifferentiableVariables == Model.CotangentVector {
+    /// The learning rate.
+    public var learningRate: Float
+    /// A coefficient used to calculate the first and second moments of
+    /// gradients.
+    public var beta1: Float
+    /// A coefficient used to calculate the first and second moments of
+    /// gradients.
+    public var beta2: Float
+    /// A small scalar added to the denominator to improve numerical stability.
+    public var epsilon: Float
+    /// The weight decay.
+    public var decay: Float
+    /// The current step.
+    public var step: Int = 0
+    /// The first moments of the weights.
+    public var firstMoments: Model.AllDifferentiableVariables
+    /// The second moments of the weights.
+    public var secondMoments: Model.AllDifferentiableVariables
+
+    public init(
+        for model: __shared Model,
+        learningRate: Float = 1e-3,
+        beta1: Float = 0.9,
+        beta2: Float = 0.999,
+        epsilon: Float = 1e-8,
+        decay: Float = 0
+    ) {
+        precondition(learningRate >= 0, "Learning rate must be non-negative")
+        precondition(0 <= beta1 && beta1 <= 1, "Beta parameter must be between 0 and 1")
+        precondition(0 <= beta2 && beta2 <= 1, "Beta parameter must be between 0 and 1")
+        precondition(decay >= 0, "Weight decay must be non-negative")
+
+        self.learningRate = learningRate
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.decay = decay
+
+        // Initialize first & second moments to be zeros of the same shape.
+        // We can't use `Model.AllDifferentiableVariables.zero` due to the
+        // interaction between Key Paths and Differentiable Arrays.
+        firstMoments = model.allDifferentiableVariables
+        secondMoments = model.allDifferentiableVariables
+        for kp in firstMoments.recursivelyAllWritableKeyPaths(to: Tensor<Float>.self) {
+            firstMoments[keyPath: kp] = Tensor<Float>(0)
+            secondMoments[keyPath: kp] = Tensor<Float>(0)
+        }
+    }
+
+
+    public func update(_ model: inout Model.AllDifferentiableVariables,
+                       along direction: Model.AllDifferentiableVariables) {
+        step += 1
+        let learningRate = self.learningRate * 1 / (1 + decay * Float(step))
+        let stepSize = learningRate * (sqrt(1 - pow(beta2, Float(step))) /
+            (1 - pow(beta1, Float(step))))
+
+        ApplyAdamUpdate(
+            learningRate: Tensor<Float>(learningRate) + Tensor<Float>(0.0),
+            beta1: Tensor<Float>(beta1) + Tensor<Float>(0.0),
+            beta2: Tensor<Float>(beta2) + Tensor<Float>(0.0),
+            not_beta1: Tensor<Float>(1 - beta1) + Tensor<Float>(0.0),
+            not_beta2: Tensor<Float>(1 - beta2) + Tensor<Float>(0.0),
+            epsilon: Tensor<Float>(epsilon) + Tensor<Float>(0.0),
+            stepSize: Tensor<Float>(stepSize) + Tensor<Float>(0.0),
+            model: &model,
+            direction: direction)
+    }
+
+    func ApplyAdamUpdate(
+        learningRate: Tensor<Float>,
+        beta1: Tensor<Float>,
+        beta2: Tensor<Float>,
+        not_beta1: Tensor<Float>,
+        not_beta2: Tensor<Float>,
+        epsilon: Tensor<Float>,
+        stepSize: Tensor<Float>,
+        model: inout Model.AllDifferentiableVariables,
+        direction: Model.AllDifferentiableVariables
+     ) {
+        // Update Float & Double Tensor variables.
+        for kp in model.recursivelyAllWritableKeyPaths(to: Tensor<Float>.self) {
+nvtxRangePushA("Tensor Update")
+            firstMoments[keyPath: kp] =
+                firstMoments[keyPath: kp] * beta1 + (not_beta1) * direction[keyPath: kp]
+            secondMoments[keyPath: kp] =
+                secondMoments[keyPath: kp] * beta2 + (not_beta2) *
+                direction[keyPath: kp] * direction[keyPath: kp]
+            model[keyPath: kp] -=
+                stepSize * firstMoments[keyPath: kp] / (sqrt(secondMoments[keyPath: kp]) + epsilon)
+nvtxRangePop()
+        }
+    }
+}
+
 
 func xresnet18 (cIn: Int = 3, cOut: Int = 1000) -> XResNet { return XResNet(1, [2, 2, 2, 2], cIn: cIn, cOut: cOut) }
 func xresnet34 (cIn: Int = 3, cOut: Int = 1000) -> XResNet { return XResNet(1, [3, 4, 6, 3], cIn: cIn, cOut: cOut) }
@@ -150,12 +271,15 @@ func xresnet101(cIn: Int = 3, cOut: Int = 1000) -> XResNet { return XResNet(4, [
 func xresnet152(cIn: Int = 3, cOut: Int = 1000) -> XResNet { return XResNet(4, [3, 8, 36, 3], cIn: cIn, cOut: cOut) }
 
 func modelInit() -> XResNet { return xresnet50(cOut: 10) }
-let optFunc: (XResNet) -> StatefulOptimizer<XResNet> = AdamOpt(lr: 1e-2, mom: 0.9, beta: 0.99, wd: 1e-2, eps: 1e-6)
+let optFunc: (XResNet) -> FAAdam<XResNet> = { model in FAAdam(for: model, learningRate: 1e-2, beta1: 0.9, beta2: 0.99, epsilon: 1e-6, decay: 1e-2) }
 let learner = Learner(data: data, lossFunc: softmaxCrossEntropy, optFunc: optFunc, modelInit: modelInit)
 let recorder = learner.makeDefaultDelegates(metrics: [accuracy])
 learner.addDelegate(learner.makeNormalize(mean: imagenetStats.mean, std: imagenetStats.std))
+learner.addDelegate(learner.makeStopEarly(numIter: 10))
 
+nvtxRangePushA("Silly")
 try! learner.fit(1)
+nvtxRangePop()
 
 // Experiment: Iterate through the whole dataset. This seems to go really fast.
 // var xOpt: Tensor<Float>? = nil

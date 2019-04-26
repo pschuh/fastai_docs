@@ -1,0 +1,5 @@
+module nvToolsExt {
+    export *
+    header "nvToolsExtFake.h"
+    link "/usr/local/cuda-10.0/targets/x86_64-linux/lib/libnvToolsExt.so"
+}

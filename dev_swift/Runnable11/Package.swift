@@ -6,14 +6,16 @@ import PackageDescription
 let package = Package(
     name: "Runnable11",
     products: [
+      .library( name: "nvToolsExt", targets: ["nvToolsExt"]),
     ],
     dependencies: [
         .package(url: "https://github.com/mxcl/Path.swift", from: "0.16.1"),
         .package(url: "https://github.com/JustHTTP/Just", from: "0.7.1")
     ],
     targets: [
+	.target( name: "nvToolsExt"),
         .target(
             name: "Runnable11",
-            dependencies: ["Just", "Path"]),
+            dependencies: ["Just", "Path", "nvToolsExt"]),
     ]
 )

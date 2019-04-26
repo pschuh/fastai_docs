@@ -6,6 +6,7 @@ file to edit: /usr/local/google/home/marcrasi/notebooks/fastai_docs/dev_swift/01
         
 import Path
 import TensorFlow
+import nvToolsExt
 
 public extension Tensor where Scalar: TensorFlowFloatingPoint {
     init(kaimingNormal shape: TensorShape, negativeSlope: Double = 1.0) {
@@ -46,14 +47,24 @@ public extension FALayer {
     // NOTE: If we use `@differentiating`, then there is a linker error. So we use `@differentiable` instead.
     @differentiable(vjp: callGrad)
     func call(_ input: Input) -> Output {
+	nvtxRangePushA("FAILayer \(String(describing: type(of: self)))")
         let activation = forward(input)
         delegate.didProduceActivation(activation)
+	nvtxRangePop()
         return activation
     }
     
     func callGrad(_ input: Input) ->
         (Output, (Self.Output.CotangentVector) -> (Self.CotangentVector, Self.Input.CotangentVector)) {
-        return Swift.valueWithPullback(at: self, input) { (m, i) in m.forward(i) }
+	nvtxRangePushA("FAILayer \(String(describing: type(of: self)))")
+        let (v, pb) = Swift.valueWithPullback(at: self, input) { (m, i) in m.forward(i) }
+	nvtxRangePop()
+	return (v, { ct in
+	    nvtxRangePushA("FAILayer grad \(String(describing: type(of: self)))")
+	    let res = pb(ct)
+	    nvtxRangePop()
+	    return res
+	})
     }
 }
 
